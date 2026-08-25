@@ -51,6 +51,12 @@ int kvspaceRmindexExt(void *h, const char *path, char *err, uint32_t err_cap);
 int kvspaceClear(void *h, char *err, uint32_t err_cap);
 int kvspaceWatch(void *h, const char *key, const uint8_t *target, uint32_t target_len,
                  uint64_t tick_ns, uint8_t **out, uint32_t *out_len);
+int kvspaceNotify(void *h, const char *key, const uint8_t *val, uint32_t len, char *err, uint32_t err_cap);
+int kvspaceTake(void *h, const char *key, uint64_t timeout_ns, uint8_t **out, uint32_t *out_len);
+int kvspaceWatchAny(void *h, const char *const *keys, uint32_t nkeys, uint64_t timeout_ns,
+                    uint8_t **out_key, uint32_t *out_key_len, uint8_t **out, uint32_t *out_len);
+int kvspaceIncr(void *h, const char *key, int64_t *out, char *err, uint32_t err_cap);
+int kvspaceExpire(void *h, const char *key, uint64_t ttl_ns, char *err, uint32_t err_cap);
 
 /* ── codec（无 handle，由前端静态实现，byte-identical） ─────────── */
 int kvspaceTlvEncode(const char *kind, const uint8_t *raw, uint32_t raw_len,

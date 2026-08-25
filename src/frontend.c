@@ -38,6 +38,12 @@ typedef struct {
     int  (*clear)(void *h, char *err, uint32_t err_cap);
     int  (*watch)(void *h, const char *key, const uint8_t *target, uint32_t target_len,
                   uint64_t tick_ns, uint8_t **out, uint32_t *out_len);
+    int  (*notify)(void *h, const char *key, const uint8_t *val, uint32_t len, char *err, uint32_t err_cap);
+    int  (*take)(void *h, const char *key, uint64_t timeout_ns, uint8_t **out, uint32_t *out_len);
+    int  (*watchany)(void *h, const char *const *keys, uint32_t nkeys, uint64_t timeout_ns,
+                     uint8_t **out_key, uint32_t *out_key_len, uint8_t **out, uint32_t *out_len);
+    int  (*incr)(void *h, const char *key, int64_t *out, char *err, uint32_t err_cap);
+    int  (*expire)(void *h, const char *key, uint64_t ttl_ns, char *err, uint32_t err_cap);
 } kvspace_vt;
 
 typedef struct {
@@ -95,6 +101,12 @@ void *kvspaceConnect(const char *dsn) {
     LOAD(clear, "kvspaceClear");
     LOAD(watch, "kvspaceWatch");
     #undef LOAD
+    /* optional: shm backend with Notify/Take/Incr/Expire/WatchAny; durable may omit */
+    *(void **)&vt->notify = dlsym(dl, "kvspaceNotify");
+    *(void **)&vt->take = dlsym(dl, "kvspaceTake");
+    *(void **)&vt->watchany = dlsym(dl, "kvspaceWatchAny");
+    *(void **)&vt->incr = dlsym(dl, "kvspaceIncr");
+    *(void **)&vt->expire = dlsym(dl, "kvspaceExpire");
 
     void *(*connect)(const char *) = dlsym(dl, "kvspaceConnect");
     if (!connect) { free(vt); dlclose(dl); return NULL; }
@@ -186,6 +198,37 @@ int kvspaceWatch(void *h, const char *key, const uint8_t *target, uint32_t targe
                  uint64_t tick_ns, uint8_t **out, uint32_t *out_len) {
     kvspace_handle *x = H(h);
     return x->vt->watch(x->backend, key, target, target_len, tick_ns, out, out_len);
+}
+
+int kvspaceNotify(void *h, const char *key, const uint8_t *val, uint32_t len, char *err, uint32_t err_cap) {
+    kvspace_handle *x = H(h);
+    if (!x->vt->notify) return 1;
+    return x->vt->notify(x->backend, key, val, len, err, err_cap);
+}
+
+int kvspaceTake(void *h, const char *key, uint64_t timeout_ns, uint8_t **out, uint32_t *out_len) {
+    kvspace_handle *x = H(h);
+    if (!x->vt->take) return 1;
+    return x->vt->take(x->backend, key, timeout_ns, out, out_len);
+}
+
+int kvspaceWatchAny(void *h, const char *const *keys, uint32_t nkeys, uint64_t timeout_ns,
+                    uint8_t **out_key, uint32_t *out_key_len, uint8_t **out, uint32_t *out_len) {
+    kvspace_handle *x = H(h);
+    if (!x->vt->watchany) return 1;
+    return x->vt->watchany(x->backend, keys, nkeys, timeout_ns, out_key, out_key_len, out, out_len);
+}
+
+int kvspaceIncr(void *h, const char *key, int64_t *out, char *err, uint32_t err_cap) {
+    kvspace_handle *x = H(h);
+    if (!x->vt->incr) return 1;
+    return x->vt->incr(x->backend, key, out, err, err_cap);
+}
+
+int kvspaceExpire(void *h, const char *key, uint64_t ttl_ns, char *err, uint32_t err_cap) {
+    kvspace_handle *x = H(h);
+    if (!x->vt->expire) return 1;
+    return x->vt->expire(x->backend, key, ttl_ns, err, err_cap);
 }
 
 /* ── codec（静态，byte-identical 头格式） ──────────────────────────── */
