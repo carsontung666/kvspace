@@ -168,6 +168,167 @@ static void test_reserve_code(void) {
           "code cap<len");
 }
 
+/* Failure contract and bounded langtype parsing:
+   - All constructors return -1 and clear *out = NULL on failure;
+   - Reserve validates storetype via build (rejecting > KVSPACE_XVALUE_ST_EXT);
+   - LangtypeBounded returns the exact non-NUL-terminated slice for valid values
+     and 0 with *out = NULL on truncated/malformed inputs without reading out of bounds. */
+static void test_bounded_and_reserve_fail(void) {
+    uint8_t sentinel = 0x5a;
+    uint8_t *buf = &sentinel;
+    uint64_t n = 0;
+    const uint8_t *lt = &sentinel;
+
+    /* Reserve with invalid storetype (4, 9, 255) or cap < body_len: reject and clear *out */
+    CHECK(kvspaceXvalueHeadReserve(4, 4, 4, "int32", &buf, &n) == -1 && buf == NULL,
+          "Reserve(storetype=4) rejected and clears *out");
+    buf = &sentinel;
+    CHECK(kvspaceXvalueHeadReserve(9, 4, 4, "int32", &buf, &n) == -1 && buf == NULL,
+          "Reserve(storetype=9) rejected and clears *out");
+    buf = &sentinel;
+    CHECK(kvspaceXvalueHeadReserve(255, 0, 0, "", &buf, &n) == -1 && buf == NULL,
+          "Reserve(storetype=255) rejected and clears *out");
+    buf = &sentinel;
+    CHECK(kvspaceXvalueHeadReserve(KVSPACE_XVALUE_ST_SLACK, 8, 4, "", &buf, &n) == -1 &&
+              buf == NULL,
+          "Reserve(cap < body_len) rejected and clears *out");
+    CHECK(kvspaceXvalueHeadReserve(KVSPACE_XVALUE_ST_SLACK, 4, 4, "", NULL, &n) == -1,
+          "Reserve(out=NULL) rejected");
+    buf = &sentinel;
+    CHECK(kvspaceXvalueHeadReserve(KVSPACE_XVALUE_ST_SLACK, 4, 4, "", &buf, NULL) == -1 &&
+              buf == NULL,
+          "Reserve(out_len=NULL) rejected and clears *out");
+
+    /* Other constructors also clear *out on failure */
+    buf = &sentinel;
+    CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, NULL, 3, "", &buf, &n) == -1 &&
+              buf == NULL,
+          "NewScalar(NULL, 3) clears *out");
+    buf = &sentinel;
+    CHECK(kvspaceXvalueHeadNewScalar(4, &sentinel, 1, "", &buf, &n) == -1 && buf == NULL,
+          "NewScalar(storetype=4) clears *out");
+    buf = &sentinel;
+    CHECK(kvspaceXvalueHeadNewSlack(NULL, 4, 4, "", &buf, &n) == -1 && buf == NULL,
+          "NewSlack(NULL, 4) clears *out");
+    buf = &sentinel;
+    CHECK(kvspaceXvalueHeadNewTensor(NULL, 0, &sentinel, 1, "", &buf, &n) == -1 && buf == NULL,
+          "NewTensor(NULL dims) clears *out");
+    buf = &sentinel;
+    CHECK(kvspaceXvalueHeadNewPtr(NULL, 0, "", &buf, &n) == -1 && buf == NULL,
+          "NewPtr(empty) clears *out");
+    buf = &sentinel;
+    CHECK(kvspaceXvalueHeadNewExt(NULL, 0, "", &buf, &n) == -1 && buf == NULL,
+          "NewExt(empty) clears *out");
+
+    /* LangtypeBounded valid inputs: scalar / tensor / ptr / empty langtype */
+    uint8_t raw8[8] = {1, 0, 0, 0, 0, 0, 0, 0};
+    CHECK(kvspaceXvalueHeadNewScalar(KVSPACE_XVALUE_ST_SHORT, raw8, 8, "int64", &buf, &n) == 0,
+          "scalar build");
+    lt = &sentinel;
+    CHECK(kvspaceXvalueHeadLangtypeBounded(buf, n, &lt) == 5 && lt != NULL &&
+              memcmp(lt, "int64", 5) == 0,
+          "bounded scalar langtype");
+    free(buf);
+
+    uint64_t dims[2] = {2, 3};
+    uint8_t raw24[24] = {0};
+    CHECK(kvspaceXvalueHeadNewTensor(dims, 2, raw24, sizeof raw24, "[2,3]float32", &buf, &n) == 0,
+          "tensor build");
+    lt = &sentinel;
+    CHECK(kvspaceXvalueHeadLangtypeBounded(buf, n, &lt) == 12 && lt != NULL &&
+              memcmp(lt, "[2,3]float32", 12) == 0,
+          "bounded tensor langtype");
+    free(buf);
+
+    CHECK(kvspaceXvalueHeadNewPtr((const uint8_t *)"/dst", 4, "[]char/utf8", &buf, &n) == 0,
+          "ptr build");
+    lt = &sentinel;
+    CHECK(kvspaceXvalueHeadLangtypeBounded(buf, n, &lt) == 11 && lt != NULL &&
+              memcmp(lt, "[]char/utf8", 11) == 0,
+          "bounded ptr langtype");
+    free(buf);
+
+    CHECK(kvspaceXvalueHeadNewNone(&buf, &n) == 0, "none build");
+    lt = &sentinel;
+    CHECK(kvspaceXvalueHeadLangtypeBounded(buf, n, &lt) == 0 && lt == NULL,
+          "bounded empty langtype returns 0 and *out=NULL");
+    free(buf);
+
+    /* LangtypeBounded malformed / truncated boundary cases */
+    lt = &sentinel;
+    CHECK(kvspaceXvalueHeadLangtypeBounded(NULL, 16, &lt) == 0 && lt == NULL,
+          "bounded NULL wire");
+
+    uint8_t short_wire[9] = {0};
+    lt = &sentinel;
+    CHECK(kvspaceXvalueHeadLangtypeBounded(short_wire, 0, &lt) == 0 && lt == NULL,
+          "bounded wire_len=0");
+    lt = &sentinel;
+    CHECK(kvspaceXvalueHeadLangtypeBounded(short_wire, 9, &lt) == 0 && lt == NULL,
+          "bounded wire_len=9 (< 10)");
+
+    /* body_len > wire_len - 10 (legacy wire without attr tail or truncated body) */
+    CHECK(kvspaceXvalueHeadReserve(KVSPACE_XVALUE_ST_SLACK, 4, 4, "int32", &buf, &n) == 0,
+          "reserve for truncation checks");
+    lt = &sentinel;
+    CHECK(kvspaceXvalueHeadLangtypeBounded(buf, KVSPACE_XVALUE_HEAD_LEN + 4, &lt) == 0 &&
+              lt == NULL,
+          "bounded rejects wire without 2-byte attr_len (body_len > wire_len - 10)");
+    lt = &sentinel;
+    CHECK(kvspaceXvalueHeadLangtypeBounded(buf, KVSPACE_XVALUE_HEAD_LEN + 4 + 1, &lt) == 0 &&
+              lt == NULL,
+          "bounded rejects 1-byte truncated attr_len");
+    /* attr_len exceeds remaining room (truncate last byte) */
+    lt = &sentinel;
+    CHECK(kvspaceXvalueHeadLangtypeBounded(buf, n - 1, &lt) == 0 && lt == NULL,
+          "bounded rejects attr_len exceeding remaining room");
+    free(buf);
+
+    /* attr_len < 2 */
+    uint8_t bad_alen[10] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 0};
+    lt = &sentinel;
+    CHECK(kvspaceXvalueHeadLangtypeBounded(bad_alen, sizeof bad_alen, &lt) == 0 && lt == NULL,
+          "bounded rejects attr_len < 2");
+
+    /* Truncated record: attr_len fits in wire_len, but p + 3 + rlen > end */
+    uint8_t trunc_rec[15] = {
+        0, 0, 0, 0, 0, 0, 0, 0,             /* head: body_len=0 */
+        7, 0,                               /* attr_len = 7 (end = 15) */
+        KVSPACE_XVALUE_ATTR_TAG_LANGTYPE,   /* tag = 1 */
+        10, 0,                              /* rlen = 10 -> p+3+10 = 23 > 15 */
+        'i', '6'
+    };
+    lt = &sentinel;
+    CHECK(kvspaceXvalueHeadLangtypeBounded(trunc_rec, sizeof trunc_rec, &lt) == 0 && lt == NULL,
+          "bounded rejects truncated attr record (p + 3 + rlen > end)");
+
+    /* Trailing record header shorter than 3 bytes (alen = 4 leaves 2 bytes) */
+    uint8_t short_rec_hdr[12] = {
+        0, 0, 0, 0, 0, 0, 0, 0,
+        4, 0,
+        KVSPACE_XVALUE_ATTR_TAG_LANGTYPE, 0
+    };
+    lt = &sentinel;
+    CHECK(kvspaceXvalueHeadLangtypeBounded(short_rec_hdr, sizeof short_rec_hdr, &lt) == 0 &&
+              lt == NULL,
+          "bounded rejects <3B trailing record header");
+
+    /* Non-NUL-terminated bounded slice after skipping an unknown tag:
+       record 1 is tag=2 (reserved), record 2 is tag=1 (langtype="int64") immediately
+       followed by non-NUL byte 9 (next record tag); verify exact rlen=5 slice. */
+    uint8_t multi_non_nul[8 + 0 + 2 + (3 + 2) + (3 + 5) + (3 + 1)] = {
+        0, 0, 0, 0, 0, 0, 0, 0,             /* head: body_len=0 */
+        19, 0,                              /* attr_len = 2 + 5 + 8 + 4 = 19 */
+        2, 2, 0, 0xaa, 0xbb,                /* tag=2, rlen=2 */
+        KVSPACE_XVALUE_ATTR_TAG_LANGTYPE, 5, 0, 'i', 'n', 't', '6', '4', /* tag=1, rlen=5 (followed by non-zero) */
+        9, 1, 0, 'Z'                        /* tag=9, rlen=1 -> lt[5] == 9 != '\0' */
+    };
+    lt = &sentinel;
+    uint16_t got_len = kvspaceXvalueHeadLangtypeBounded(multi_non_nul, sizeof multi_non_nul, &lt);
+    CHECK(got_len == 5 && lt != NULL && lt[5] == 9 && memcmp(lt, "int64", 5) == 0,
+          "bounded returns exact non-NUL-terminated slice after skipping unknown tag");
+}
+
 int main(void) {
     test_none();
     test_scalar();
@@ -175,6 +336,7 @@ int main(void) {
     test_tensor();
     test_ptr_ext();
     test_reserve_code();
+    test_bounded_and_reserve_fail();
     if (failures) {
         fprintf(stderr, "%d failed\n", failures);
         return 1;

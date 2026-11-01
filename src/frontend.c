@@ -96,7 +96,6 @@ static kvspace_handle *H(void *h) { return (kvspace_handle *)h; }
 /* 活跃句柄表：durable 的写侧惰性（body 由调用方在返回后填，落盘延到下一次 op），故漏调
  * Close 就退出会丢最后一笔写。进程正常退出时前端兜底落盘再关闭，兑现 kvspace.h 的退出保证。 */
 static kvspace_handle  *live;
-static int              live_hooked;
 static pthread_mutex_t  live_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void handle_free(kvspace_handle *x) {
@@ -114,9 +113,14 @@ static void live_unlink(kvspace_handle *x) {
     pthread_mutex_unlock(&live_lock);
 }
 
-/* 退出兜底：未 Close 句柄逐个关闭——durable 的 Close 落盘未决写，落盘失败由后端自己写
- * stderr。数据可以丢（后端故障），但绝不静默。 */
-static void exit_close(void) {
+/* Exit fallback: close any unclosed handles so durable backends flush pending writes
+ * (reporting errors to stderr).
+ *
+ * Uses an ELF destructor rather than atexit: atexit handlers run in LIFO order, so if
+ * the host registered its own cleanup before the first Connect, an atexit handler here
+ * would free handles before the host cleanup runs (causing use-after-free). Destructors
+ * run after all atexit handlers (_dl_fini / dyld finalizer), and dlclose is safe there. */
+__attribute__((destructor)) static void exit_close(void) {
     for (;;) {
         pthread_mutex_lock(&live_lock);
         kvspace_handle *x = live;
@@ -237,8 +241,9 @@ void *kvspaceConnect(const char *dsn) {
     LOAD(rmindexext, "kvspaceRmindexExt");
     LOAD(clear, "kvspaceClear");
     LOAD(watch, "kvspaceWatch");
-    LOAD(xvalue_body_view, "kvspaceXvalueBodyView");
     #undef LOAD
+    /* Optional symbol: trampoline returns -2 (unsupported) when absent. */
+    *(void **)&vt->xvalue_body_view = dlsym(dl, "kvspaceXvalueBodyView");
     *(void **)&vt->resolveref = dlsym(dl, "kvspaceResolveRef");
     *(void **)&vt->getbyref = dlsym(dl, "kvspaceGetByRef");
     *(void **)&vt->setpartbyref = dlsym(dl, "kvspaceSetPartByRef");
@@ -271,7 +276,6 @@ void *kvspaceConnect(const char *dsn) {
     pthread_mutex_lock(&live_lock);
     h->next = live;
     live = h;
-    if (!live_hooked) { live_hooked = 1; atexit(exit_close); }
     pthread_mutex_unlock(&live_lock);
     return h;
 }
@@ -326,6 +330,7 @@ int kvspaceSetPartByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
 int kvspaceXvalueBodyView(void *h, const kvspaceRef_t *ref, const char *key_fallback,
                     kvspaceXvalueBodyView_t *out) {
     kvspace_handle *x = H(h);
+    if (!x->vt->xvalue_body_view) return -2;
     return x->vt->xvalue_body_view(x->backend, ref, key_fallback, out);
 }
 

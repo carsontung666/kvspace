@@ -6,9 +6,11 @@
  *   shm://...      → libkvspace-c.so.1
  *   其余（redis/fs/s3）→ libkvspace_durable.so.1
  *
- * Wire: [len:u48 LE@0-5][storetype:u8@6][ptr:u8@7][body@8][langtype@8+len].
- * Head is fixed 8 bytes; body offset is always 8; langtype (plaintext UTF-8,
- * incl. dims) is the value tail at 8+len. Single-key write — no attr key.
+ * Wire: [len:u48 LE@0-5][storetype:u8@6][ptr:u8@7][body@8][attr@8+len].
+ * Head is fixed 8 bytes; body offset is always 8. attr = [attr_len:u16 LE]
+ * + records [tag:u8][len:u16 LE][data]; tag 1 = langtype (plaintext UTF-8,
+ * incl. leading [dims]). Empty attr = 2 bytes. Single-key write — no attr key.
+ * See kvspace/xvalue_head.h.
  */
 
 #ifndef KVSPACE_H
@@ -33,7 +35,7 @@ extern "C" {
 #define KVSPACE_STORETYPE_FIXED_LARGE 2
 #define KVSPACE_STORETYPE_EXT         3
 
-/* XValue 元数据。langtype 取自 value 尾部 @8+len。 */
+/* XValue metadata. langtype is read from attr tag=1; ndim/dims are parsed from leading [dims]. */
 typedef struct {
     uint16_t headlen;       /* head 总字节数；body 起于偏移 headlen */
     uint8_t  ref;           /* 存储位置：见 KVSPACE_REF_* */
@@ -57,13 +59,17 @@ void  kvspaceClose(void *h);
 
 /* ── 单点读写 / 目录 ──────────────────────────────────────────── */
 
-/* 借用读：*out 指向后端常驻空间（shm mmap / durable 读缓存），生命周期到该 key 被写/删
- * 或 handle close，调用方不得 free。resolve=1 穿透 link。key 不存在/空值 → *out=NULL、
- * *out_len=0、返回 0。
- * 例外（volatile keys）：`/vthread/*‥status` 每次读都重读后端，上一视图只保活到该 key
- * 下一次读（见 spec CABI「volatile keys」）。 */
+/* Borrowed read: *out points into backend storage (shm mmap / durable read cache),
+ * valid until the key is overwritten/deleted or the handle is closed; do not free.
+ * Missing/empty key -> *out=NULL, *out_len=0, returns 0.
+ * resolve != 0 follows leaf Ptr chains (up to 16 hops; loops/dangling treated as missing);
+ * resolve == 0 returns the leaf wire as-is without following leaf Ptr.
+ * Exception (volatile keys): `/vthread/<vid>/‥status` re-reads the backend on each call,
+ * keeping the previous view alive only until the next read of that key. */
 int kvspaceGet(void *h, const char *key, int resolve, uint8_t **out, uint32_t *out_len);
-/* Store a complete XValue before returning. */
+/* Full-value write: writes a complete XValue (validating wire header and attr bounds).
+ * Stores syntactically valid Ptr XValues at the wire layer without dereferencing the target
+ * or checking its current langtype (allowing multi-hop `slot -> ‥arg` bindings and forward/cyclic pointers). */
 int kvspaceSetValue(void *h, const char *key, const uint8_t *value, uint32_t value_len,
                     char *err, uint32_t err_cap);
 
@@ -89,12 +95,11 @@ int kvspaceSetValueByRef(void *h, kvspaceRef_t *ref, const char *key_fallback,
                          const uint8_t *value, uint32_t value_len,
                          char *err, uint32_t err_cap);
 
-/* shm-only slot view：把已绑定槽的映射内地址一次性交给调用方，供每步直读/直写。
- * `head` 指向 XValue 起点，`body = head + headlen`；`cap` 是整 box 物理容量
- * （allocator 实际值，不是请求值），`body_cap = cap - headlen`。借用模型：
- * 寿命到该 key 被写/删、view 失效或 handle close。
- * 返回 0=成功；-1=不存在/ref 失效/不可视槽；-2=后端不支持（调用方回退既有 API，
- * 每句柄只判定一次）。 */
+/* shm-only slot view: exposes mapped slot addresses for direct per-step read/write.
+ * `head` points to XValue start, `body = head + headlen`; `cap` is physical box capacity,
+ * `body_cap = cap - headlen`. Borrowed until key overwrite/delete, view invalidation, or close.
+ * Returns 0 on success, -1 if missing/invalid/non-viewable, -2 if unsupported by backend
+ * (including when the backend does not export this symbol; caller falls back once per handle). */
 typedef struct {
     uint8_t *head;
     uint32_t headlen;
@@ -149,15 +154,16 @@ int kvspaceSetPart(void *h, const char *key, uint32_t offset, const uint8_t *buf
 /* Read the wire head + langtype tail. Missing keys return nonzero. */
 int kvspaceGetHead(void *h, const char *key, kvspaceHead_t *out);
 
-/* 就地写：key 必须已存在、kind 不变、body_len 必须等于原 body_len——返回原 box 的 body
- * 偏移指针供调用方直接写。违反前置条件 → 非 0 + err（绝不静默重分配、绝不回落）。
- * 落盘时机：body 由调用方在返回后填，故本笔在下一次 kvspace* 调用（读也算）或 kvspaceClose
- * 时落盘；前者失败以返回码 + err 报出，后者失败写 stderr。 */
+/* In-place write: key must exist with unchanged kind and body_len; returns existing body
+ * pointer for direct mutation, or nonzero + err on precondition failure (never reallocates).
+ * resolve != 0 follows leaf Ptr chains (up to 16 hops) and writes the terminal target in place;
+ * resolve == 0 operates on the leaf itself without following leaf Ptr.
+ * Flushed on the next kvspace* call or kvspaceClose. */
 int kvspaceWriteInPlace(void *h, const char *key, int resolve, uint32_t body_len,
                         uint8_t **body, char *err, uint32_t err_cap);
 
 /* Reserve a new XValue and return its body pointer; fill it before another KVSpace call.
- * langtype（可为空 = 无类型）随头/尾部整体写入——单 key 一次写。 */
+ * langtype (empty/NULL = untyped) is written with the header/attr in a single-key write. */
 int kvspaceWriteNewPlace(void *h, const char *key, uint8_t ref, uint8_t storetype,
                          uint32_t body_len, uint64_t body_cap, const char *langtype,
                          uint8_t **body, char *err, uint32_t err_cap);
@@ -185,10 +191,13 @@ int kvspaceClear(void *h, char *err, uint32_t err_cap);
 int kvspaceWatch(void *h, const char *key, const uint8_t *target, uint32_t target_len,
                  uint64_t tick_ns, uint8_t **out, uint32_t *out_len);
 
-/* ── XValue 构造（无 handle，由前端静态实现，byte-identical）───────────
- * head 固定 8 字节，直接 memcpy struct + body + langtype 尾部
- * （见 kvspace/xvalue_head.h）。langtype 为空串 = 无类型（不追加尾部）。 */
+/* XValue constructors (stateless, implemented in frontend, byte-identical across backends).
+ * Fixed 8-byte header + body + attr region (see kvspace/xvalue_head.h).
+ * Empty/NULL langtype = untyped (omits langtype record; attr region is just 2-byte attr_len). */
 
+/* Construct a leaf Ptr XValue (storetype=SLACK, ptr=PTR, body=target path bytes,
+ * target_kindexpr written to attr tag=1; "" means unconstrained; rejects "any" and empty target).
+ * Pure wire constructor: does not connect to a backend or validate target existence/langtype. */
 int kvspaceNewPtr(const char *target_kindexpr, const char *target,
                   uint8_t **out, uint32_t *out_len);
 int kvspaceNewChar(const uint8_t *bytes, uint32_t len, const char *langtype,
