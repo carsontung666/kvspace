@@ -18,7 +18,7 @@ static int check(void *kv, const char *key, int64_t expected, int round) {
     uint32_t len; uint8_t *v = kv_get(kv, key, &len);
     if (!v || len == 0) { printf("ROUND%d MISS  %s\n", round, key); return 0; }
     char kind[32]; const uint8_t *body; uint32_t bl;
-    read_kind(kv, key, v, len, kind, sizeof(kind), &body, &bl);
+    read_kind(v, len, kind, sizeof(kind), &body, &bl);
     if (bl < 8 || strcmp(kind, "int64") != 0) {
         printf("ROUND%d CORRUPT %s: bad kind=%s bl=%u\n", round, key, kind, bl);
         free(v); return 0;
@@ -36,7 +36,7 @@ static int check_str(void *kv, const char *key, const char *expected, int round)
     uint32_t len; uint8_t *v = kv_get(kv, key, &len);
     if (!v || len == 0) { printf("ROUND%d MISS  %s\n", round, key); return 0; }
     char kind[32]; const uint8_t *body; uint32_t bl;
-    read_kind(kv, key, v, len, kind, sizeof(kind), &body, &bl);
+    read_kind(v, len, kind, sizeof(kind), &body, &bl);
     if (strcmp(kind, "char/utf8") != 0) {
         printf("ROUND%d CORRUPT %s: bad kind\n", round, key); free(v); return 0;
     }
@@ -138,7 +138,7 @@ int main(void) {
         uint32_t len; uint8_t *v = kv_get(kv, k, &len);
         if (!v || len == 0) { printf("ROUND5 MISS  big%d\n", i); errors++; continue; }
         char kind[32]; const uint8_t *body; uint32_t bl;
-        read_kind(kv, k, v, len, kind, sizeof(kind), &body, &bl);
+        read_kind(v, len, kind, sizeof(kind), &body, &bl);
         if (bl != MAX_VAL_SZ || memcmp(body, big_vals[i], MAX_VAL_SZ) != 0) {
             printf("ROUND5 CORRUPT big%d\n", i); errors++;
         }

@@ -1,7 +1,7 @@
 /*
  * 02_cpp — C++ RAII 封装：extern "C" 直接调用 libkvspace dispatch 前端
  *
- * #566：head 固定 8 字节（body 偏移恒 8），类型走 x‥langtype attr key。
+ * #571: Fixed 8-byte header (body offset is always 8); langtype in inline attr region.
  *
  * 编译: g++ -std=c++17 02_cpp.cpp -lkvspace
  */
@@ -31,8 +31,7 @@ struct KV {
     }
     ~KV() { kvspaceClose(kv); ::unlink(path.c_str()); }
 
-    // 写即构造：memcpy 固定头取 body_len/storetype/ptr，就地/新位置二选一原语，
-    // 往返回指针写 body。langtype 由调用方显式给（写 x‥langtype attr key）。
+    // Write into returned body pointer; WriteNewPlace writes langtype with the header/attr region.
     void set(const char *key, const char *langtype, const uint8_t *val, uint32_t len) {
         if (!val || len < KVSPACE_XVALUE_HEAD_LEN) return;
         kvspaceXvalueHead hd;
@@ -40,24 +39,24 @@ struct KV {
         uint64_t bl = kvspaceXvalueHeadLen(&hd);
         uint8_t *dst = nullptr; char err[256];
         if (kvspaceWriteInPlace(kv, key, 1, (uint32_t)bl, &dst, err, sizeof(err)) != 0)
-            kvspaceWriteNewPlace(kv, key, hd.ptr, hd.storetype, langtype,
-                                 (uint32_t)bl, bl, &dst, err, sizeof(err));
+            kvspaceWriteNewPlace(kv, key, hd.ptr, hd.storetype, (uint32_t)bl, bl,
+                                 langtype, &dst, err, sizeof(err));
         if (bl && dst) memcpy(dst, val + KVSPACE_XVALUE_HEAD_LEN, (size_t)bl);
     }
-    // 借用读：out 指向 kvspace 常驻空间，拷进 std::string 后即失效，不 free。
-    // kind 由 kvspaceGetHead 从 x‥langtype attr key 读。
+    // Borrowed read: kind is decoded by kvspaceGetHead from inline attr; body length is head.body_len.
     bool get(const char *key, std::string &kind, std::string &raw) {
         uint8_t *out = nullptr; uint32_t len = 0;
         kvspaceGet(kv, key, 0, &out, &len);
-        if (!out || len == 0) return false;
+        if (!out || len < KVSPACE_XVALUE_HEAD_LEN) return false;
         kvspaceHead_t h;
         if (kvspaceGetHead(kv, key, &h) != 0) return false;
         const char *k = (const char *)h.langtype;
         if (k[0] == '*' || k[0] == '@') k++;
         if (k[0] == '[') { const char *e = strchr(k, ']'); if (e) k = e + 1; }
         kind = k;
-        raw.assign((const char *)(out + KVSPACE_XVALUE_HEAD_LEN),
-                   len > KVSPACE_XVALUE_HEAD_LEN ? len - KVSPACE_XVALUE_HEAD_LEN : 0);
+        uint32_t bl = h.body_len > 0 ? (uint32_t)h.body_len : 0;
+        if (bl > len - KVSPACE_XVALUE_HEAD_LEN) return false;
+        raw.assign((const char *)(out + KVSPACE_XVALUE_HEAD_LEN), bl);
         return true;
     }
     void del(const char *key) {
@@ -82,11 +81,12 @@ struct KV {
 
 int main() {
     auto xv_int = [](int64_t v) {
-        uint8_t *b; uint32_t n; kvspaceNewInt64(v, &b, &n);
+        uint8_t *b; uint32_t n; kvspaceNewInt64(v, "int64", &b, &n);
         return std::pair<uint8_t *, uint32_t>{b, n};
     };
     auto xv_str = [](const char *s) {
-        uint8_t *b; uint32_t n; kvspaceNewChar((const uint8_t *)s, (uint32_t)strlen(s), &b, &n);
+        uint8_t *b; uint32_t n;
+        kvspaceNewChar((const uint8_t *)s, (uint32_t)strlen(s), "char/utf8", &b, &n);
         return std::pair<uint8_t *, uint32_t>{b, n};
     };
 

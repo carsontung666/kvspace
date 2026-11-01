@@ -7,9 +7,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 BUILD = ROOT.parent / "build" / "tutorial-c"
-# #566：用仓库 include（固定 8 字节 head + New* 构造器）；系统 /usr/include 仍是旧 wire 头。
+# Use repo include/ matching this frontend version rather than potentially stale /usr/include.
 INC = str(ROOT.parent / "include")
-LIB = "/usr/lib"
+# Frontend/backend library directory (<prefix>/lib/kvspace from cmake --install; override via KVSPACE_LIB).
+LIB = os.environ.get("KVSPACE_LIB", "/usr/lib/kvspace")
 
 passed = 0
 failed = 0

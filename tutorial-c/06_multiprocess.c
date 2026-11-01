@@ -88,7 +88,7 @@ static int reader(const char *path, int64_t seed) {
         uint32_t l; uint8_t *v = kv_get(kv, k, &l);
         if (v && l > 0) {
             char kind[32]; const uint8_t *body; uint32_t bl;
-            read_kind(kv, k, v, l, kind, sizeof(kind), &body, &bl);
+            read_kind(v, l, kind, sizeof(kind), &body, &bl);
             if (bl >= 8 && strcmp(kind, "int64") == 0) {
                 int64_t got = *(const int64_t *)body;
                 if (got != expected) {
@@ -108,7 +108,7 @@ static int reader(const char *path, int64_t seed) {
         uint32_t l; uint8_t *v = kv_get(kv, k, &l);
         if (!v || l == 0) continue;
         char kind[32]; const uint8_t *body; uint32_t bl;
-        read_kind(kv, k, v, l, kind, sizeof(kind), &body, &bl);
+        read_kind(v, l, kind, sizeof(kind), &body, &bl);
         if (strcmp(kind, "char/utf8") != 0) {
             printf("[reader] BADKIND %s: %s\n", k, kind); errors++;
         }
@@ -123,7 +123,7 @@ static int reader(const char *path, int64_t seed) {
         uint32_t l; uint8_t *v = kv_get(kv, k, &l);
         if (v && l > 0) {
             char kind[32]; const uint8_t *body; uint32_t bl;
-            read_kind(kv, k, v, l, kind, sizeof(kind), &body, &bl);
+            read_kind(v, l, kind, sizeof(kind), &body, &bl);
             if (bl == 1024) big_ok++;
             free(v);
         }

@@ -1,11 +1,11 @@
 // 04_rust — Rust FFI 直调 libkvspace（dispatch 前端），shm:// 后端
-// #566：head 固定 8 字节（body 偏移恒 8），类型走 x‥langtype attr key。
+// #571: Fixed 8-byte header (body offset is always 8); langtype in inline attr region.
 // 编译: rustc 04_rust.rs -l kvspace
 
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::ptr;
 
-// 与 kvspaceHead_t 对齐（langtype 由 kvspaceGetHead 从 attr key 填）。
+// Matches kvspaceHead_t (langtype populated by kvspaceGetHead from inline attr).
 #[repr(C)]
 struct Head {
     headlen: u16,
@@ -53,10 +53,9 @@ extern "C" {
     // 就地写：key 已存在且 body_len 不变 → 返回原 box body 偏移指针；否则非 0。
     fn kvspaceWriteInPlace(h: *mut c_void, key: *const c_char, resolve: c_int, body_len: u32,
                            body: *mut *mut u8, err: *mut c_char, err_cap: u32) -> c_int;
-    // 新位置写：按 (ref, storetype, langtype, body_len) 分配 box、写 head（顺写 attr key），
-    // 返回 body 偏移指针。
+    // Allocate box and write fixed header + attr region (including langtype), returning body pointer.
     fn kvspaceWriteNewPlace(h: *mut c_void, key: *const c_char, r#ref: u8, storetype: u8,
-                            langtype: *const c_char, body_len: u32, body_cap: u64,
+                            body_len: u32, body_cap: u64, langtype: *const c_char,
                             body: *mut *mut u8, err: *mut c_char, err_cap: u32) -> c_int;
     // 前缀枚举：ListLen 定计数，逐 idx ListAt 借用取名（不得 free）。
     fn kvspaceListLen(h: *mut c_void, prefix: *const c_char, expand_ext: c_int,
@@ -66,8 +65,10 @@ extern "C" {
     fn kvspaceDel(h: *mut c_void, keys: *const *const c_char, n: u32, err: *mut c_char, err_cap: u32) -> c_int;
     fn kvspaceDelTree(h: *mut c_void, prefix: *const c_char, err: *mut c_char, err_cap: u32) -> c_int;
     fn kvspaceMkindex(h: *mut c_void, path: *const c_char, capacity: u32, err: *mut c_char, err_cap: u32) -> c_int;
-    fn kvspaceNewInt64(v: i64, out: *mut *mut u8, out_len: *mut u32) -> c_int;
-    fn kvspaceNewChar(bytes: *const u8, len: u32, out: *mut *mut u8, out_len: *mut u32) -> c_int;
+    // New*: langtype is stored in inline attr (empty = untyped).
+    fn kvspaceNewInt64(v: i64, langtype: *const c_char, out: *mut *mut u8, out_len: *mut u32) -> c_int;
+    fn kvspaceNewChar(bytes: *const u8, len: u32, langtype: *const c_char,
+                      out: *mut *mut u8, out_len: *mut u32) -> c_int;
 }
 
 fn cs(s: &str) -> CString { CString::new(s).unwrap() }
@@ -75,7 +76,8 @@ fn cs(s: &str) -> CString { CString::new(s).unwrap() }
 fn enc_int(v: i64) -> Vec<u8> {
     let mut out: *mut u8 = ptr::null_mut();
     let mut n: u32 = 0;
-    unsafe { kvspaceNewInt64(v, &mut out, &mut n); }
+    let lt = cs("int64");
+    assert_eq!(unsafe { kvspaceNewInt64(v, lt.as_ptr(), &mut out, &mut n) }, 0);
     let b = unsafe { std::slice::from_raw_parts(out, n as usize) }.to_vec();
     unsafe { free(out as *mut c_void); }
     b
@@ -85,13 +87,14 @@ fn new_str(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
     let mut out: *mut u8 = ptr::null_mut();
     let mut n: u32 = 0;
-    unsafe { kvspaceNewChar(b.as_ptr(), b.len() as u32, &mut out, &mut n); }
+    let lt = cs("char/utf8");
+    assert_eq!(unsafe { kvspaceNewChar(b.as_ptr(), b.len() as u32, lt.as_ptr(), &mut out, &mut n) }, 0);
     let r = unsafe { std::slice::from_raw_parts(out, n as usize) }.to_vec();
     unsafe { free(out as *mut c_void); }
     r
 }
 
-// 读 kind：kvspaceGetHead 从 x‥langtype attr key 填 h.langtype，body 从偏移 8 起。
+// Read kind via kvspaceGetHead (from inline attr); body starts at offset 8 with length h.body_len.
 fn read_kind(kv: *mut c_void, key: &str, data: &[u8]) -> (String, Vec<u8>) {
     let mut h = Head::default();
     if unsafe { kvspaceGetHead(kv, cs(key).as_ptr(), &mut h) } != 0 {
@@ -116,8 +119,7 @@ impl KV {
         assert!(!ptr.is_null());
         KV { ptr, path: path.to_string() }
     }
-    // 写即构造：memcpy 固定头取 body_len/storetype/ptr，就地/新位置二选一原语，
-    // 往返回指针写 body。langtype 由调用方显式给（写 x‥langtype attr key）。
+    // Write into returned body pointer; WriteNewPlace writes langtype with the header/attr region.
     fn set(&self, key: &str, langtype: &str, val: &[u8]) {
         if val.len() < 8 { return; }
         let hd: XvalueHead = unsafe { std::ptr::read(val.as_ptr() as *const XvalueHead) };
@@ -128,8 +130,10 @@ impl KV {
         let mut err = [0i8; 256];
         unsafe {
             if kvspaceWriteInPlace(self.ptr, ck.as_ptr(), 1, bl, &mut dst, err.as_mut_ptr(), 256) != 0 {
-                kvspaceWriteNewPlace(self.ptr, ck.as_ptr(), hd.ptr, hd.storetype, lt.as_ptr(),
-                                     bl, bl as u64, &mut dst, err.as_mut_ptr(), 256);
+                let rc = kvspaceWriteNewPlace(self.ptr, ck.as_ptr(), hd.ptr, hd.storetype,
+                                              bl, bl as u64, lt.as_ptr(), &mut dst,
+                                              err.as_mut_ptr(), 256);
+                assert_eq!(rc, 0, "write {key} failed");
             }
             if bl > 0 && !dst.is_null() {
                 ptr::copy_nonoverlapping(val[8..].as_ptr(), dst, bl as usize);

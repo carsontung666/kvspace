@@ -5,8 +5,8 @@
  * # === Set & Get ===
  * # /t01/a	int64:42
  * # === Set & List ===
- * # a	int64
- * # b	int64
+ * # a	int64	42
+ * # b	int64	7
  * # c	char/utf8
  * # === Get bulk ===
  * # /t01/a	int64:42
@@ -16,8 +16,8 @@
  * # /t01/nonexist	(nil)
  * # === Del ===
  * # /t01/a	(nil)
- * # b	int64
- * # c	char/utf8
+ * # b
+ * # c
  * # /end
  */
 #include "common.h"
@@ -27,7 +27,7 @@ static void get(void *kv, const char *key) {
     uint32_t len; uint8_t *v = kv_get(kv, key, &len);
     if (!v || len == 0) { printf("%s\t(nil)\n", key); return; }
     char kind[32]; const uint8_t *body; uint32_t bl;
-    read_kind(kv, key, v, len, kind, sizeof(kind), &body, &bl);
+    read_kind(v, len, kind, sizeof(kind), &body, &bl);
     printf("%s\t%s:", key, kind);
     if (strcmp(kind, "int64") == 0 && bl >= 8) printf("%ld", *(const int64_t *)body);
     else if (strcmp(kind, "char/utf8") == 0) printf("%.*s", (int)bl, body);
@@ -58,7 +58,7 @@ static void list(void *kv, const char *dir, int show_kind) {
             char full[512]; snprintf(full, sizeof(full), "%s%s", dir, name);
             uint32_t vl; uint8_t *v = kv_get(kv, full, &vl);
             if (v) { char kind[32]; const uint8_t *body; uint32_t bl;
-                read_kind(kv, full, v, vl, kind, sizeof(kind), &body, &bl);
+                read_kind(v, vl, kind, sizeof(kind), &body, &bl);
                 printf("%s\t%s", name, kind);
                 if (strcmp(kind, "int64") == 0 && bl >= 8) printf("\t%ld", *(const int64_t *)body);
                 printf("\n");

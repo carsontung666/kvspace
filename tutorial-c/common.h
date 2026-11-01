@@ -1,6 +1,6 @@
 // common.h — tutorial 公共助手：统一 kvspace* ABI 的 XValue 构造/读取与单键读写便捷封装。
 // 所有 tutorial 均链接 libkvspace（dispatch 前端），运行期经 shm:// 选择 kvspace-c 后端。
-// #566：head 固定 8 字节（body 偏移恒 8），类型/形状走 x‥langtype attr key。
+// #571: Fixed 8-byte header (body offset is always 8); langtype (incl. [dims]) in inline attr.
 #ifndef KVSPACE_TUTORIAL_COMMON_H
 #define KVSPACE_TUTORIAL_COMMON_H
 
@@ -11,51 +11,54 @@
 #include <stdlib.h>
 #include <string.h>
 
-// ── 构造：返回 malloc 的 XValue 字节（固定头 + body），长度写入 *len，调用方 free ──
+// Constructors: return malloc-allocated XValue bytes (header + body + attr); caller frees.
 
 static inline uint8_t *new_int64(int64_t v, uint32_t *len) {
     uint8_t *out = NULL; uint32_t n = 0;
-    kvspaceNewInt64(v, &out, &n);
+    kvspaceNewInt64(v, "int64", &out, &n);
     *len = n; return out;
 }
 
 static inline uint8_t *new_str(const char *s, uint32_t *len) {
     uint8_t *out = NULL; uint32_t n = 0;
-    kvspaceNewChar((const uint8_t *)s, (uint32_t)strlen(s), &out, &n);
+    kvspaceNewChar((const uint8_t *)s, (uint32_t)strlen(s), "char/utf8", &out, &n);
     *len = n; return out;
 }
 
 static inline uint8_t *new_bytes(const uint8_t *raw, uint32_t rl, uint32_t *len) {
     uint8_t *out = NULL; uint64_t n = 0;
     uint64_t dims[1] = { rl };
-    kvspaceXvalueHeadNewTensor(dims, 1, raw, rl, &out, &n);
+    kvspaceXvalueHeadNewTensor(dims, 1, raw, rl, NULL, &out, &n);
     *len = n > UINT32_MAX ? 0 : (uint32_t)n;
     return out;
 }
 
-// ── 读取：kvspaceGetHead 读 x‥langtype attr key 取 base kind（去 */@ 前缀与 [dims] 段），
-//    返回 body 指针/长度（body 偏移恒 8）──
+// Reader: bounded langtype parse from inline attr (stripping leading [dims] for base kind);
+// body starts at offset 8 with length from header.
 
-static inline const char *read_kind(void *h, const char *key, const uint8_t *data, uint32_t len,
-                              char *kind, size_t cap,
-                              const uint8_t **body, uint32_t *body_len) {
-    if (!h || !key || !data || len < KVSPACE_XVALUE_HEAD_LEN) return NULL;
-    kvspaceHead_t hd;
-    if (kvspaceGetHead(h, key, &hd) != 0) return NULL;
-    const char *k = (const char *)hd.langtype;
-    if (k[0] == '*' || k[0] == '@') k++;
-    const char *base = k;
-    if (k[0] == '[') { const char *e = strchr(k, ']'); if (e) base = e + 1; }
-    size_t n = strlen(base);
+static inline const char *read_kind(const uint8_t *data, uint32_t len,
+                                    char *kind, size_t cap,
+                                    const uint8_t **body, uint32_t *body_len) {
+    if (cap) kind[0] = 0;
+    *body = NULL; *body_len = 0;
+    if (!data || len < KVSPACE_XVALUE_HEAD_LEN || cap == 0) return NULL;
+    kvspaceXvalueHead hd;
+    memcpy(&hd, data, sizeof hd);
+    uint64_t bl = kvspaceXvalueHeadLen(&hd);
+    if (bl > len - KVSPACE_XVALUE_HEAD_LEN) return NULL;
+    const uint8_t *lt = NULL;
+    size_t n = kvspaceXvalueHeadLangtypeBounded(data, len, &lt);
+    const uint8_t *e = lt && n && lt[0] == '[' ? memchr(lt, ']', n) : NULL;
+    if (e) { n -= (size_t)(e + 1 - lt); lt = e + 1; }
     if (n >= cap) n = cap - 1;
-    memcpy(kind, base, n); kind[n] = 0;
+    if (n) memcpy(kind, lt, n);
+    kind[n] = 0;
     *body = data + KVSPACE_XVALUE_HEAD_LEN;
-    *body_len = len - KVSPACE_XVALUE_HEAD_LEN;
+    *body_len = (uint32_t)bl;
     return kind;
 }
 
-// ── 单键读写封装（写：New* 构造 XValue + 显式 langtype → WriteNewPlace 顺写 attr key+body；
-//    就地/新位置二选一原语）──
+// Single-key read/write helpers (WriteInPlace or WriteNewPlace with inline langtype).
 
 static inline int kv_set(void *h, const char *key, const char *langtype,
                          const uint8_t *val, uint32_t len) {
@@ -65,8 +68,8 @@ static inline int kv_set(void *h, const char *key, const char *langtype,
     uint64_t bl = kvspaceXvalueHeadLen(&hd);
     uint8_t *dst = NULL; char err[256];
     if (kvspaceWriteInPlace(h, key, 1, (uint32_t)bl, &dst, err, sizeof err) != 0 &&
-        kvspaceWriteNewPlace(h, key, hd.ptr, hd.storetype, langtype,
-                             (uint32_t)bl, bl, &dst, err, sizeof err) != 0)
+        kvspaceWriteNewPlace(h, key, hd.ptr, hd.storetype, (uint32_t)bl, bl,
+                             langtype, &dst, err, sizeof err) != 0)
         return -1;
     if (bl && dst) memcpy(dst, val + KVSPACE_XVALUE_HEAD_LEN, (size_t)bl);
     return 0;

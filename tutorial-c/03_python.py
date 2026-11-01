@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """03_python — ctypes 直调 libkvspace（dispatch 前端），shm:// 后端
-#566：head 固定 8 字节（body 偏移恒 8），类型走 x‥langtype attr key。"""
+#571: Fixed 8-byte header (body offset is always 8); langtype in inline attr region."""
 
 import ctypes
 import os
@@ -17,7 +17,7 @@ CCHARPP = ctypes.POINTER(ctypes.c_char_p)
 KVSPACE_XVALUE_HEAD_LEN = 8
 
 
-# 与 kvspaceHead_t 对齐（langtype 由 kvspaceGetHead 从 attr key 填）。
+# Matches kvspaceHead_t (langtype populated by kvspaceGetHead from inline attr).
 class Head(ctypes.Structure):
     _fields_ = [
         ("headlen", ctypes.c_uint16),
@@ -61,8 +61,9 @@ bind(lib.kvspaceGet, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.POI
 bind(lib.kvspaceGetHead, [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(Head)], ctypes.c_int)
 # 写即构造：就地/新位置二选一原语，往返回的 body 偏移指针写字节。
 bind(lib.kvspaceWriteInPlace, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint32, ctypes.POINTER(U8P), ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
+# Signature matches kvspace.h: (h, key, ref, storetype, body_len, body_cap, langtype, body, err, err_cap).
 bind(lib.kvspaceWriteNewPlace, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint8, ctypes.c_uint8,
-                                ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint64,
+                                ctypes.c_uint32, ctypes.c_uint64, ctypes.c_char_p,
                                 ctypes.POINTER(U8P), ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
 # 前缀枚举：ListLen 定计数 + 逐 idx ListAt 借用取名。
 bind(lib.kvspaceListLen, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int32)], ctypes.c_int)
@@ -71,25 +72,33 @@ bind(lib.kvspaceListAt, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.
 bind(lib.kvspaceDel, [ctypes.c_void_p, CCHARPP, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
 bind(lib.kvspaceDelTree, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
 bind(lib.kvspaceMkindex, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint32], ctypes.c_int)
-bind(lib.kvspaceNewInt64, [ctypes.c_int64, ctypes.POINTER(U8P), U32P], ctypes.c_int)
-bind(lib.kvspaceNewChar, [U8P, ctypes.c_uint32, ctypes.POINTER(U8P), U32P], ctypes.c_int)
+# New*: langtype is stored in inline attr (empty/None = untyped).
+bind(lib.kvspaceNewInt64, [ctypes.c_int64, ctypes.c_char_p, ctypes.POINTER(U8P), U32P], ctypes.c_int)
+bind(lib.kvspaceNewChar, [U8P, ctypes.c_uint32, ctypes.c_char_p, ctypes.POINTER(U8P), U32P], ctypes.c_int)
+bind(lib.free, [ctypes.c_void_p], None)
 
 
 def enc_int(v):
     out, n = U8P(), ctypes.c_uint32()
-    lib.kvspaceNewInt64(v, ctypes.byref(out), ctypes.byref(n))
-    return ctypes.string_at(out, n.value)
+    if lib.kvspaceNewInt64(v, b"int64", ctypes.byref(out), ctypes.byref(n)) != 0:
+        raise RuntimeError("kvspaceNewInt64 failed")
+    data = ctypes.string_at(out, n.value)
+    lib.free(out)  # allocated by frontend malloc
+    return data
 
 
 def new_str(s):
     b = s.encode()
     buf = (ctypes.c_uint8 * len(b)).from_buffer_copy(b)
     out, n = U8P(), ctypes.c_uint32()
-    lib.kvspaceNewChar(buf, len(b), ctypes.byref(out), ctypes.byref(n))
-    return ctypes.string_at(out, n.value)
+    if lib.kvspaceNewChar(buf, len(b), b"char/utf8", ctypes.byref(out), ctypes.byref(n)) != 0:
+        raise RuntimeError("kvspaceNewChar failed")
+    data = ctypes.string_at(out, n.value)
+    lib.free(out)  # allocated by frontend malloc
+    return data
 
 
-# 读 kind：kvspaceGetHead 从 x‥langtype attr key 填 h.langtype，body 从偏移 8 起。
+# Read kind via kvspaceGetHead (from inline attr); body starts at offset 8 with length h.body_len.
 def read_kind(kv, key, data):
     h = Head()
     if lib.kvspaceGetHead(kv, key.encode(), ctypes.byref(h)) != 0:
@@ -127,8 +136,7 @@ class KV:
     def __exit__(self, *a):
         self.close()
 
-    # 写即构造：memcpy 固定头取 body_len/storetype/ptr，就地/新位置二选一原语，
-    # 往返回指针写 body。langtype 由调用方显式给（写 x‥langtype attr key）。
+    # Write into returned body pointer; WriteNewPlace writes langtype with the header/attr region.
     def set(self, key, langtype, val):
         if len(val) < KVSPACE_XVALUE_HEAD_LEN:
             return
@@ -139,8 +147,9 @@ class KV:
         dst = U8P()
         err = ctypes.create_string_buffer(256)
         if lib.kvspaceWriteInPlace(self.kv, key.encode(), 1, bl, ctypes.byref(dst), err, 256) != 0:
-            lib.kvspaceWriteNewPlace(self.kv, key.encode(), hd.ptr, hd.storetype,
-                                     langtype.encode(), bl, bl, ctypes.byref(dst), err, 256)
+            if lib.kvspaceWriteNewPlace(self.kv, key.encode(), hd.ptr, hd.storetype,
+                                        bl, bl, langtype.encode(), ctypes.byref(dst), err, 256) != 0:
+                raise RuntimeError(f"write {key}: {err.value.decode(errors='replace')}")
         if bl > 0 and dst:
             ctypes.memmove(dst, ctypes.byref(buf, KVSPACE_XVALUE_HEAD_LEN), bl)
 
