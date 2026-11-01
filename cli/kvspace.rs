@@ -8,34 +8,9 @@ use std::process::exit;
 /* 固定 head 8 字节（见 kvspace/xvalue_head.h）：body 偏移恒 8。 */
 const KVSPACE_XVALUE_HEAD_LEN: usize = 8;
 const KVSPACE_XVALUE_ST_SHORT: u8 = 0;
-
-/* 与 kvspace.h 的 kvspaceHead_t 布局一致（ro/vid 已从 ABI 删除）。 */
-#[repr(C)]
-struct Head {
-    headlen: u16,
-    r#ref: u8,
-    storetype: u8,
-    body_len: i32,
-    ndim: i32,
-    dims: [i32; 8],
-    langtype: [u8; 256],
-    langtype_len: i32,
-    body_offset: i32,
-    body_cap: u64,
-}
-
-fn zero_head() -> Head {
-    unsafe { std::mem::zeroed() }
-}
-
-fn langtype_bytes(h: &Head) -> &[u8] {
-    let n = h
-        .langtype
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(h.langtype.len());
-    &h.langtype[..n]
-}
+/* head.ptr: 0=inline, 1=ptr, 2=@ext (KVSPACE_XVALUE_PTR_*). */
+const KVSPACE_XVALUE_PTR_PTR: u8 = 1;
+const KVSPACE_XVALUE_PTR_EXT: u8 = 2;
 
 #[link(name = "kvspace")]
 extern "C" {
@@ -163,7 +138,6 @@ extern "C" {
         out: *mut *mut u8,
         out_len: *mut u64,
     ) -> c_int;
-    fn kvspaceGetHead(h: *mut c_void, key: *const c_char, out: *mut Head) -> c_int;
 }
 
 fn cs(s: &str) -> *const c_char {
@@ -191,9 +165,10 @@ fn fail_op(err: &[u8; 256], op: &str) -> ! {
 }
 
 struct Value {
-    kind: String,
-    r#ref: i32,
-    dims: Vec<i32>,
+    kind: String,   // Base kind (langtype without leading [dims])
+    r#ref: u8,      // head.ptr: 0=inline, 1=ptr, 2=@ext
+    storetype: u8,  // head.storetype
+    dims: Vec<i32>, // Leading [dims] parsed from langtype
     body: Vec<u8>,
 }
 
@@ -202,34 +177,25 @@ struct Value {
    值自描述：直接解 wire，不经 kvspaceGetHead（它对 Ptr 穿透，读不到本体）。 */
 fn from_wire(data: &[u8]) -> Value {
     if data.len() < KVSPACE_XVALUE_HEAD_LEN {
-        return Value { kind: String::new(), r#ref: 0, dims: vec![], body: vec![] };
+        return Value {
+            kind: String::new(),
+            r#ref: 0,
+            storetype: 0,
+            dims: vec![],
+            body: vec![],
+        };
     }
     let body_len = wire_len(data) as usize;
-    let storetype = data[6];
-    let ptr = data[7];
-    let r#ref = match ptr {
-        1 => 1,
-        2 => 2,
-        _ => {
-            let _ = storetype;
-            0
-        }
-    };
-    let lt = wire_langtype(data, body_len);
-    let (_ltdims, kind) = parse_langtype(&lt);
+    let (dims, kind) = parse_langtype(&wire_langtype(data, body_len));
     /* body 只到 head.len 为止；其后是 attr 区，不属 body。 */
     let start = KVSPACE_XVALUE_HEAD_LEN;
-    let end = (start + body_len).min(data.len());
-    let body = if end > start {
-        data[start..end].to_vec()
-    } else {
-        vec![]
-    };
+    let end = start.saturating_add(body_len).min(data.len());
     Value {
         kind,
-        r#ref,
-        dims: vec![],
-        body,
+        r#ref: data[7],
+        storetype: data[6],
+        dims,
+        body: data[start..end].to_vec(),
     }
 }
 
@@ -244,8 +210,8 @@ fn wire_len(data: &[u8]) -> u64 {
 
 /// 扫 attr 区取 tag=1（langtype）；无记录/坏 attr → 空串。
 fn wire_langtype(data: &[u8], body_len: usize) -> String {
-    let base = KVSPACE_XVALUE_HEAD_LEN as usize + body_len;
-    if base + 2 > data.len() {
+    let base = KVSPACE_XVALUE_HEAD_LEN.saturating_add(body_len);
+    if base.saturating_add(2) > data.len() {
         return String::new();
     }
     let alen = (data[base] as usize) | ((data[base + 1] as usize) << 8);
@@ -286,15 +252,6 @@ fn parse_langtype(lt: &str) -> (Vec<i32>, String) {
     (Vec::new(), lt.to_string())
 }
 
-fn le_u32(b: &[u8]) -> u32 {
-    (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16) | ((b[3] as u32) << 24)
-}
-fn le_u64(b: &[u8]) -> u64 {
-    b.iter()
-        .enumerate()
-        .fold(0u64, |a, (i, &x)| a | ((x as u64) << (8 * i)))
-}
-
 fn fmt_float(v: f64) -> String {
     let s = format!("{}", v);
     if s.contains('.') {
@@ -304,54 +261,89 @@ fn fmt_float(v: f64) -> String {
     }
 }
 
+/// Element width in bytes for fixed-width scalars; None otherwise.
+fn scalar_width(kind: &str) -> Option<usize> {
+    match kind {
+        "bool" | "int8" | "uint8" => Some(1),
+        "int16" | "uint16" => Some(2),
+        "int32" | "uint32" | "float32" => Some(4),
+        "int64" | "uint64" | "float64" => Some(8),
+        _ => None,
+    }
+}
+
+/// Decode one little-endian fixed-width scalar; returns None on unknown kind or short slice.
+fn scalar_text(kind: &str, b: &[u8]) -> Option<String> {
+    let w = scalar_width(kind)?;
+    let b = b.get(..w)?;
+    Some(match kind {
+        "bool" => (b[0] != 0).to_string(),
+        "int8" => (b[0] as i8).to_string(),
+        "uint8" => b[0].to_string(),
+        "int16" => i16::from_le_bytes(b.try_into().ok()?).to_string(),
+        "uint16" => u16::from_le_bytes(b.try_into().ok()?).to_string(),
+        "int32" => i32::from_le_bytes(b.try_into().ok()?).to_string(),
+        "uint32" => u32::from_le_bytes(b.try_into().ok()?).to_string(),
+        "float32" => fmt_float(f32::from_le_bytes(b.try_into().ok()?) as f64),
+        "int64" => i64::from_le_bytes(b.try_into().ok()?).to_string(),
+        "uint64" => u64::from_le_bytes(b.try_into().ok()?).to_string(),
+        "float64" => fmt_float(f64::from_le_bytes(b.try_into().ok()?)),
+        _ => return None,
+    })
+}
+
+fn join_dims(dims: &[i32]) -> String {
+    dims.iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn plain(v: &Value) -> String {
     // ref 先于 kind 判空：不约束指针（空 kindexpr）也是合法值。
-    if v.r#ref == 1 {
+    if v.r#ref == KVSPACE_XVALUE_PTR_PTR {
         return format!("→{}", String::from_utf8_lossy(&v.body));
+    }
+    if v.r#ref == KVSPACE_XVALUE_PTR_EXT {
+        return format!("@{}", String::from_utf8_lossy(&v.body));
     }
     if v.kind.is_empty() {
         return "None".to_string();
     }
-    match v.kind.as_str() {
-        "bool" => (v.body.first().copied().unwrap_or(0) != 0).to_string(),
-        "int8" => (v.body.first().map(|&b| b as i8).unwrap_or(0) as i64).to_string(),
-        "int16" => (i16::from_le_bytes([v.body[0], v.body[1]]) as i64).to_string(),
-        "int32" => {
-            (i32::from_le_bytes([v.body[0], v.body[1], v.body[2], v.body[3]]) as i64).to_string()
+    if let Some(w) = scalar_width(&v.kind) {
+        // Format fixed-width numeric tensors ([dims]) element-by-element.
+        if !v.dims.is_empty() {
+            let items: Vec<String> = v
+                .body
+                .chunks_exact(w)
+                .filter_map(|c| scalar_text(&v.kind, c))
+                .collect();
+            return format!("[{}]", items.join(","));
         }
-        "int64" => (i64::from_le_bytes(v.body[..8].try_into().unwrap())).to_string(),
-        "uint8" => v.body.first().copied().unwrap_or(0).to_string(),
-        "uint16" => (u16::from_le_bytes([v.body[0], v.body[1]])).to_string(),
-        "uint32" => le_u32(&v.body).to_string(),
-        "uint64" => le_u64(&v.body).to_string(),
-        "float32" => fmt_float(f32::from_le_bytes(v.body[..4].try_into().unwrap()) as f64),
-        "float64" => fmt_float(f64::from_le_bytes(v.body[..8].try_into().unwrap())),
-        "char/utf8" | "char/ascii" => String::from_utf8_lossy(&v.body).into_owned(),
+        return scalar_text(&v.kind, &v.body)
+            .unwrap_or_else(|| format!("<short body: {} bytes>", v.body.len()));
+    }
+    match v.kind.as_str() {
         "char/utf32" => v
             .body
-            .chunks(4)
-            .map(|c| char::from_u32(le_u32(c)).unwrap_or('\u{FFFD}'))
+            .chunks_exact(4)
+            .map(|c| {
+                char::from_u32(u32::from_le_bytes([c[0], c[1], c[2], c[3]])).unwrap_or('\u{FFFD}')
+            })
             .collect(),
-        "stringkeymap" => format!(
-            "map[{}]",
-            v.dims
-                .iter()
-                .map(|d| d.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
+        "stringkeymap" => format!("map[{}]", join_dims(&v.dims)),
         "index" => format!("({})", v.dims.first().copied().unwrap_or(0)),
-        "extindex" => String::from_utf8_lossy(&v.body).into_owned(),
+        // char/utf8, char/ascii, and other kinds: decode as lossy UTF-8.
         _ => String::from_utf8_lossy(&v.body).into_owned(),
     }
 }
 
 fn format_value(v: &Value) -> String {
-    if v.r#ref == 1 {
+    if v.r#ref == KVSPACE_XVALUE_PTR_PTR {
         return format!("→{}:{}", String::from_utf8_lossy(&v.body), v.kind);
     }
     if v.kind.is_empty() {
-        return "None".to_string();
+        return plain(v); // None or @ext locator
     }
     format!("{}:{}", v.kind, plain(v))
 }
@@ -368,13 +360,13 @@ fn get(kv: *mut c_void, key: &str) -> Vec<u8> {
     }
 }
 
-// 解析 value 语法为 (wire, langtype)：langtype 是无前缀裸 kindexpr（int64/[]char/utf8/键·值），
-// 由 codec 写进值内 attr 区（tag=1 记录，随 head+body 单 key 整体落）；空 = 无类型。
-fn parse_value(raw: &str) -> (Vec<u8>, String) {
+// Parse CLI value syntax into full XValue wire bytes (langtype stored in tag=1 attr).
+// Empty Vec represents `nil:` (delete).
+fn parse_value(raw: &str) -> Vec<u8> {
     let mut out: *mut u8 = std::ptr::null_mut();
     let mut len: u32 = 0;
     if let Some(rest) = raw.strip_prefix('*') {
-        // `*:kindexpr:target`（kindexpr 在前，与 string:/int: 同构）；`*:target` 为不约束指针。
+        // `*:kindexpr:target` (typed ptr) or `*:target` (unconstrained ptr).
         let rest = rest.strip_prefix(':').unwrap_or(rest);
         let (k, t) = match rest.find(':') {
             Some(i) => (&rest[..i], &rest[i + 1..]),
@@ -383,14 +375,14 @@ fn parse_value(raw: &str) -> (Vec<u8>, String) {
         if unsafe { kvspaceNewPtr(cs(k), cs(t), &mut out, &mut len) != 0 } {
             fatalf(&format!("parse value failed: {:?}", raw));
         }
-        let v = take_wire(out, len);
-        return (v, k.to_string()); // kindexpr 无 * 前缀；不约束（空 kindexpr）→ 空 langtype
+        // Unprefixed kindexpr; empty kindexpr -> unconstrained (empty langtype).
+        return take_wire(out, len);
     }
     if let Some(langtype) = raw.strip_prefix("map:") {
         if !langtype.contains('·') {
             fatalf("map requires key·value langtype");
         }
-        // 空 body 的短定长头（langtype 写进值内 attr 区）。
+        // Empty-body short header with langtype in the attr region.
         let mut len64: u64 = 0;
         if unsafe {
             kvspaceXvalueHeadNewScalar(
@@ -404,8 +396,7 @@ fn parse_value(raw: &str) -> (Vec<u8>, String) {
         } {
             fatalf(&format!("parse value failed: {:?}", raw));
         }
-        let v = take_wire(out, len64 as u32);
-        return (v, langtype.to_string()); // 裸 kindexpr（如 int·string）
+        return take_wire(out, len64 as u32); // bare kindexpr (e.g. int·string)
     }
     let split = raw.find(':').unwrap_or(raw.len());
     let kind = &raw[..split];
@@ -445,11 +436,12 @@ fn parse_value(raw: &str) -> (Vec<u8>, String) {
                 .parse()
                 .unwrap_or_else(|_| fatalf(&format!("parse value failed: {:?}", raw)));
             // 4 字节小端 f32 body 的短定长头。
+            let le = f.to_le_bytes();
             let mut len64: u64 = 0;
             if unsafe {
                 kvspaceXvalueHeadNewScalar(
                     KVSPACE_XVALUE_ST_SHORT,
-                    &f as *const f32 as *const u8,
+                    le.as_ptr(),
                     4,
                     cs(langtype),
                     &mut out,
@@ -484,9 +476,9 @@ fn parse_value(raw: &str) -> (Vec<u8>, String) {
                 fatalf(&format!("parse value failed: {:?}", raw));
             }
         },
-        "nil" => return (Vec::new(), String::new()), // 删除（无值）
+        "nil" => return Vec::new(), // delete (no value)
         "index" => fatalf("use mkindex for directories"),
-        // 无 kind 前缀或未识别前缀 → 默认按字符串处理（见 help 的 value 语法）。
+        // Default to string when no recognized kind prefix is present.
         _ => unsafe {
             if kvspaceNewChar(
                 raw.as_ptr(),
@@ -500,7 +492,7 @@ fn parse_value(raw: &str) -> (Vec<u8>, String) {
             }
         },
     }
-    (take_wire(out, len), langtype.to_string())
+    take_wire(out, len)
 }
 
 // codec 产出为 frontend malloc，读出即 free；失败已 fatalf 退出，到这里的 out 恒非空。
@@ -512,12 +504,16 @@ fn take_wire(out: *mut u8, len: u32) -> Vec<u8> {
     }
 }
 
-// 单 key 写整值（head + body + attr 尾，langtype 已在 attr 区内，见 #571）。
+// Single-key full-value write (head + body + attr tail).
 fn set_one(kv: *mut c_void, key: &str, val: &[u8]) {
     if val.is_empty() {
+        // `nil:` deletes the key; report errors just like `del` (missing key returns 0).
         let key_ptr = cs(key);
         let mut err = [0u8; 256];
-        unsafe { kvspaceDel(kv, &key_ptr, 1, err.as_mut_ptr() as *mut c_char, 256) };
+        let rc = unsafe { kvspaceDel(kv, &key_ptr, 1, err.as_mut_ptr() as *mut c_char, 256) };
+        if rc != 0 {
+            fail_op(&err, &format!("set {} nil", key));
+        }
         return;
     }
     let ck = cs(key);
@@ -542,15 +538,19 @@ fn set_one(kv: *mut c_void, key: &str, val: &[u8]) {
     }
 }
 
-// 前缀遍历：先 ListLen 定计数，再逐 idx ListAt 取名（借用回收缓冲，读出即自持）。resolve=1 穿透 link。
-// ListLen/ListAt 要求前缀是目录形（/ 或 · 结尾），裸前缀（如 /t）在此归一，避免 `list /t` 静默为空。
-fn list_names(kv: *mut c_void, prefix: &str, expand_ext: bool) -> Vec<String> {
-    let dir = if prefix == "/" || prefix.ends_with('/') || prefix.ends_with('·') {
+// Normalize directory prefix (trailing `/` or `·`): ListLen/ListAt, mkindex, and
+// extindex mounts address directory keys; append `/` to bare prefixes like `/t`.
+fn dir_form(prefix: &str) -> String {
+    if prefix.ends_with('/') || prefix.ends_with('·') {
         prefix.to_string()
     } else {
         format!("{}/", prefix)
-    };
-    let p = cs(&dir);
+    }
+}
+
+// Prefix listing via ListLen + ListAt (resolve=1 follows links; expand_ext=false lists own children only).
+fn list_names(kv: *mut c_void, prefix: &str, expand_ext: bool) -> Vec<String> {
+    let p = cs(&dir_form(prefix));
     let mut count: i32 = 0;
     unsafe {
         if kvspaceListLen(kv, p, expand_ext as c_int, 1, &mut count) != 0 || count <= 0 {
@@ -592,20 +592,35 @@ fn join_path(parent: &str, child: &str) -> String {
     format!("{}/{}", parent, child)
 }
 
+// An extindex mount is an @ext value on the directory key (head.ptr=2), whose body
+// holds the source path. Ignore langtype since backends differ on whether it is set.
 fn read_ext(kv: *mut c_void, prefix: &str) -> String {
-    let v = get(kv, prefix);
+    let v = get(kv, &dir_form(prefix));
     if v.is_empty() {
         return String::new();
     }
     let d = from_wire(&v);
-    if d.kind != "extindex" || d.body.is_empty() {
+    if d.r#ref != KVSPACE_XVALUE_PTR_EXT {
         return String::new();
     }
-    // body = ext_path 前缀 + cap×M 成员矩阵；ext_path = body[..body_len − cap*M]。
-    let cap = d.dims.get(1).copied().unwrap_or(0).max(0) as usize;
-    let m = d.dims.get(2).copied().unwrap_or(0).max(0) as usize;
-    let off = d.body.len().saturating_sub(cap * m);
-    String::from_utf8_lossy(&d.body[..off]).into_owned()
+    String::from_utf8_lossy(&d.body).into_owned()
+}
+
+// Shared list/tree arguments: [prefix] [--kind[=false]] [--showext[=false]]; default prefix is `/`.
+fn parse_walk_args(tail: &[String], show_kind_default: bool) -> (String, bool, bool) {
+    let mut show_ext = true;
+    let mut show_kind = show_kind_default;
+    let mut prefix = "/".to_string();
+    for a in tail {
+        match a.as_str() {
+            "--kind" => show_kind = true,
+            "--kind=false" => show_kind = false,
+            "--showext" => show_ext = true,
+            "--showext=false" => show_ext = false,
+            _ => prefix = a.clone(),
+        }
+    }
+    (prefix, show_ext, show_kind)
 }
 
 fn print_help() {
@@ -672,30 +687,27 @@ fn main() {
             if tail.len() != 2 {
                 fatalf("usage: kvspace set <key> <value>");
             }
-            let (val, _langtype) = parse_value(&tail[1]);
-            set_one(kv, &tail[0], &val);
+            set_one(kv, &tail[0], &parse_value(&tail[1]));
         }
         "head" => {
+            if tail.is_empty() {
+                fatalf("usage: kvspace head <key>...");
+            }
             for k in tail {
                 let v = get(kv, k);
                 if v.is_empty() {
                     println!("{}\t(nil)", k);
                 } else {
+                    // ndim/dims come from leading [dims] in langtype.
                     let d = from_wire(&v);
-                    let storetype = v[6];
-                    let ptr = v[7];
-                    let dims = &d.dims[..];
                     println!(
                         "{}\t{}\tref={}\tstoretype={}\tndim={}\tdims=[{}]",
                         k,
                         d.kind,
-                        ptr,
-                        storetype,
-                        dims.len(),
-                        dims.iter()
-                            .map(|x| x.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",")
+                        d.r#ref,
+                        d.storetype,
+                        d.dims.len(),
+                        join_dims(&d.dims)
                     );
                 }
             }
@@ -770,11 +782,7 @@ fn main() {
                 .first()
                 .unwrap_or_else(|| fatalf("usage: kvspace mkindex <path> [capacity]"));
             // 目录形归一：shm 自动补 /，durable 强校验 —— CLI 统一补，三后端一致。
-            let p = if p.ends_with('/') || p.ends_with('·') {
-                p.to_string()
-            } else {
-                format!("{}/", p)
-            };
+            let p = dir_form(p);
             let capacity: u32 = tail.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
             let mut err = [0u8; 256];
             let rc = unsafe {
@@ -809,56 +817,24 @@ fn main() {
                 )
             };
             if rc != 0 {
-                let n = err.iter().position(|&b| b == 0).unwrap_or(err.len());
-                if n > 0 {
-                    fatalf(&String::from_utf8_lossy(&err[..n]));
-                }
-                // 部分后端不填 err（如 shm）：给出可诊断的兜底信息。
-                fatalf(&format!(
-                    "extindex {} {}: failed rc={}（path/src_key 须目录形键且 src_key 须存在）",
-                    tail[0], tail[1], rc
-                ));
+                // Fallback diagnostic when backend leaves err empty.
+                fail_op(
+                    &err,
+                    &format!(
+                        "extindex {} {} (path/src_key must be directory keys and src_key must exist)",
+                        tail[0], tail[1]
+                    ),
+                );
             }
         }
         "list" | "ls" => {
-            let mut show_ext = true;
-            let mut show_kind = true;
-            let mut prefix: Option<&str> = None;
-            for a in tail {
-                if a == "--kind" {
-                    show_kind = true;
-                } else if a == "--kind=false" {
-                    show_kind = false;
-                } else if a == "--showext" {
-                    show_ext = true;
-                } else if a == "--showext=false" {
-                    show_ext = false;
-                } else {
-                    prefix = Some(a);
-                }
-            }
-            fprint_list(kv, prefix.unwrap_or("/"), show_ext, show_kind);
+            let (p, show_ext, show_kind) = parse_walk_args(tail, true);
+            fprint_list(kv, &p, show_ext, show_kind);
         }
         "tree" => {
-            let mut show_ext = true;
-            let mut show_kind = false;
-            let mut prefix: Option<&str> = None;
-            for a in tail {
-                if a == "--kind" {
-                    show_kind = true;
-                } else if a == "--kind=false" {
-                    show_kind = false;
-                } else if a == "--showext" {
-                    show_ext = true;
-                } else if a == "--showext=false" {
-                    show_ext = false;
-                } else {
-                    prefix = Some(a);
-                }
-            }
-            let p = prefix.unwrap_or("/");
+            let (p, show_ext, show_kind) = parse_walk_args(tail, false);
             println!("{}", p);
-            fprint_tree(kv, p, "", show_ext, show_kind);
+            fprint_tree(kv, &p, "", show_ext, show_kind);
         }
         "clear" => {
             let mut err = [0u8; 256];
@@ -878,31 +854,18 @@ fn main() {
     }
 }
 
-fn strip_ext_children(kv: *mut c_void, prefix: &str, children: Vec<String>) -> Vec<String> {
-    let ext = read_ext(kv, prefix);
-    if ext.is_empty() {
-        return children;
-    }
-    let ext_children = list_names(kv, &ext, false);
-    let n = children.len().saturating_sub(ext_children.len());
-    children[..n].to_vec()
-}
-
 fn fprint_list(kv: *mut c_void, prefix: &str, show_ext: bool, show_kind: bool) {
-    let mut children = list_names(kv, prefix, true);
-    if !show_ext {
-        children = strip_ext_children(kv, prefix, children);
-    }
-    for c in children {
-        let full = join_path(prefix, &c);
-        let v = get(kv, &full);
+    // When show_ext is false, list own children only and print the ext mount separately below.
+    for c in list_names(kv, prefix, show_ext) {
+        let v = get(kv, &join_path(prefix, &c));
         if v.is_empty() {
             println!("{}", c);
-        } else if show_kind {
-            let d = from_wire(&v);
+            continue;
+        }
+        let d = from_wire(&v);
+        if show_kind {
             println!("{}\t{}\t{}", c, d.kind, plain(&d));
         } else {
-            let d = from_wire(&v);
             println!("{}\t{}", c, plain(&d));
         }
     }
@@ -918,10 +881,8 @@ fn fprint_list(kv: *mut c_void, prefix: &str, show_ext: bool, show_kind: bool) {
 }
 
 fn fprint_tree(kv: *mut c_void, prefix: &str, indent: &str, show_ext: bool, show_kind: bool) {
-    let mut children = list_names(kv, prefix, true);
-    if !show_ext {
-        children = strip_ext_children(kv, prefix, children);
-    }
+    // When show_ext is false, list own children only and print the ext mount separately below.
+    let mut children = list_names(kv, prefix, show_ext);
     children.sort_by(|a, b| {
         let (aa, bb) = (a.trim_end_matches('/'), b.trim_end_matches('/'));
         if aa == bb {
@@ -944,11 +905,12 @@ fn fprint_tree(kv: *mut c_void, prefix: &str, indent: &str, show_ext: bool, show
             let v = get(kv, &full);
             if v.is_empty() {
                 println!("{}{}{}", indent, branch, c);
-            } else if show_kind {
-                let d = from_wire(&v);
+                continue;
+            }
+            let d = from_wire(&v);
+            if show_kind {
                 println!("{}{}{}\t{}\t{}", indent, branch, c, d.kind, plain(&d));
             } else {
-                let d = from_wire(&v);
                 println!("{}{}{}\t{}", indent, branch, c, plain(&d));
             }
         }
