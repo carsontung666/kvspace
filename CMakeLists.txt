@@ -56,14 +56,22 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/kvspace.pc DESTINATION ${CMAKE_INSTALL
 # ── CLI（cli/ 独立 Cargo 项目）──────────────────────────────────────
 # 走本仓 dispatch 前端的 C ABI，故须在 kvspace 目标之后构建；
 # 安装到 <prefix>/bin（prefix 默认 /usr → /usr/bin，与 kvlang 的 CLI 一致）。
-# RUNPATH 用相对自身的 $ORIGIN/../lib：可执行在 bin/、前端在 lib/，tarball
-# 换机器后仍然解析。$ 转义成 $$ 以免被 CMake 当变量展开。
+# Embed relative RUNPATH entries:
+#   $ORIGIN/../lib                      -- release tarball (bin/ + lib/)
+#   $ORIGIN/../<libdir>/kvspace         -- cmake --install (<prefix>/<libdir>/kvspace)
+# Use @loader_path on macOS; escape $ as $$ for CMake.
+# release.yml packages this binary directly without rebuilding.
 find_program(CARGO_EXECUTABLE cargo)
 if(CARGO_EXECUTABLE)
   set(KVSPACE_CLI_BIN "${CMAKE_CURRENT_SOURCE_DIR}/cli/target/release/kvspace")
+  if(APPLE)
+    set(KVSPACE_CLI_ORIGIN "@loader_path")
+  else()
+    set(KVSPACE_CLI_ORIGIN "$$ORIGIN")
+  endif()
   add_custom_target(kvspace-cli ALL
     COMMAND ${CMAKE_COMMAND} -E env
-            "RUSTFLAGS=-L native=$<TARGET_FILE_DIR:kvspace> -C link-arg=-Wl,-rpath,'$$ORIGIN/../lib'"
+            "RUSTFLAGS=-L native=$<TARGET_FILE_DIR:kvspace> -C link-arg=-Wl,-rpath,'${KVSPACE_CLI_ORIGIN}/../lib' -C link-arg=-Wl,-rpath,'${KVSPACE_CLI_ORIGIN}/../${CMAKE_INSTALL_LIBDIR}/kvspace'"
             "${CARGO_EXECUTABLE}" build --release
             --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/cli/Cargo.toml"
     BYPRODUCTS "${KVSPACE_CLI_BIN}"

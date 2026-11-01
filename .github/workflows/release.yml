@@ -13,10 +13,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: 构建
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
-      - name: 构建 CLI（cli/ 独立 Cargo 项目，走 dispatch 前端 C ABI）
+      - name: Verify CLI RUNPATH (built by cmake kvspace-cli target)
         run: |
-          # CLI 用 #[link(name = "kvspace")] 链本仓刚构建的前端 → 把 build/ 交给链接器
-          RUSTFLAGS="-L native=$PWD/build" cargo build --release --manifest-path cli/Cargo.toml
+          set -euo pipefail
+          readelf -d cli/target/release/kvspace | grep -F 'RUNPATH' | grep -F '$ORIGIN/../lib'
       - name: 打包 ABI 产物
         run: |
           set -euo pipefail
