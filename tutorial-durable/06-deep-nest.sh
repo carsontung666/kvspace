@@ -2,31 +2,30 @@
 # expected:
 # === deep tree ===
 # /deep/a/b/c/d/e/f	int64:6
-# a/	index	(1)
+# a/	lib	
 # /deep/a/b/c	int64:3
-# d/	index	(1)
-# c	int64	3
-# c/	index	(1)
+# d/	lib	
+# c/	lib	
 # === deltree mid ===
 # /deep/a/b/c/d/e/f	(nil)
 # /deep/a/b/c/d/e	(nil)
 # /deep/a/b/c	int64:3
 # === deltree leaf ===
 # /deep/a/b/c	(nil)
-# a/	index	(0)
+# a/	lib	
 # /end
 
 set -e
-KV="$HOME/.local/bin/kvspace"
+KV="${KVSPACE_BIN:-kvspace}"
 $KV deltree /deep/
 
 echo "=== deep tree ==="
-$KV set /deep/ index:
-$KV set /deep/a/ index:
-$KV set /deep/a/b/ index:
-$KV set /deep/a/b/c/ index:
-$KV set /deep/a/b/c/d/ index:
-$KV set /deep/a/b/c/d/e/ index:
+$KV mkindex /deep/
+$KV mkindex /deep/a/
+$KV mkindex /deep/a/b/
+$KV mkindex /deep/a/b/c/
+$KV mkindex /deep/a/b/c/d/
+$KV mkindex /deep/a/b/c/d/e/
 $KV set /deep/a/b/c/d/e/f int:6
 $KV get /deep/a/b/c/d/e/f
 $KV list /deep/

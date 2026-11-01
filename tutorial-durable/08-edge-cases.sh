@@ -10,9 +10,9 @@
 # /end
 
 set -e
-KV="$HOME/.local/bin/kvspace"
+KV="${KVSPACE_BIN:-kvspace}"
 $KV deltree /e/
-$KV set /e/ index:
+$KV mkindex /e/
 
 echo "=== overwrite kind ==="
 $KV set /e/v int:42

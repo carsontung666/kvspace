@@ -8,12 +8,12 @@
 # /end
 
 set -e
-KV="$HOME/.local/bin/kvspace"
+KV="${KVSPACE_BIN:-kvspace}"
 $KV deltree /ext/
 $KV deltree /base/
 $KV deltree /mid/
 
-$KV set /base/ index:
+$KV mkindex /base/
 $KV set /base/a int:1
 $KV extindex /mid/ /base/
 

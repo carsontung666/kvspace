@@ -1,7 +1,7 @@
 #!/bin/bash
 # expected:
 # === map head ===
-# /m	stringkeymap	ref=0	ro=0	vid=0	ndim=2	dims=[2,3]
+# /m	[int64,int64]·float32	ref=0	storetype=0	ndim=0	dims=[]
 # === map list ===
 # [0,0]	float32	1.0
 # [0,1]	float32	3.140000104904175
@@ -15,12 +15,12 @@
 # /end
 
 set -e
-KV="$HOME/.local/bin/kvspace"
+KV="${KVSPACE_BIN:-kvspace}"
 $KV deltree /m/
 $KV deltree /h/
 
 echo "=== map head ==="
-$KV set /m· 'map[2,3]:'
+$KV set /m 'map:[int64,int64]·float32'
 $KV head /m
 
 echo "=== map list ==="
@@ -33,7 +33,7 @@ echo "=== get ==="
 $KV get '/m·[1,2]' '/m·[9,9]'
 
 echo "=== 命名成员 vs 坐标成员 ==="
-$KV set /h· 'map[0]:'   # 显式声明容器（memhead），并建 memindex；object kind 已移除
+$KV set /h 'map:[]char/utf8·int64'   # declare container (memhead) explicitly
 $KV set /h·x 'int:1'
 $KV set '/h·[0]' 'int:2'
 $KV list /h· --kind=false --showext=false

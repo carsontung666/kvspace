@@ -20,9 +20,9 @@
 # /end
 
 set -e
-KV="$HOME/.local/bin/kvspace"
+KV="${KVSPACE_BIN:-kvspace}"
 $KV deltree /t/
-$KV set /t/ index:
+$KV mkindex /t/
 
 echo "=== int ==="
 $KV set /t/zero int:0

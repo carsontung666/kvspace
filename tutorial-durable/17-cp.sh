@@ -16,9 +16,11 @@
 # /end
 
 set -e
-KV="$HOME/.local/bin/kvspace"
+KV="${KVSPACE_BIN:-kvspace}"
 $KV deltree /src/
 $KV deltree /dst/
+$KV deltree /p/
+$KV deltree /q/
 $KV deltree /d1/
 $KV deltree /d2/
 $KV deltree /base/
@@ -33,7 +35,7 @@ $KV get /dst/one
 
 # cpdir 复制 · 成员容器（base + memindex + 成员）
 echo "=== cpdir memindex container ==="
-$KV set /p· 'map[0]:'   # 容器值（memhead）+ memindex；index: 只建 memindex，成员写会被拒
+$KV set /p 'map:[]char/utf8·float64'   # container value (memhead) required for `·` members
 $KV set /p·x float:3.14
 $KV set /p·y int:42
 $KV cpdir /p /q
@@ -41,7 +43,7 @@ $KV list "/q·"
 
 # cpdir 复制 /-children 子树
 echo "=== cpdir /-children subtree ==="
-$KV set /d1/ index:
+$KV mkindex /d1/
 $KV set /d1/a int:1
 $KV set /d1/b int:2
 $KV cpdir /d1 /d2
@@ -49,10 +51,10 @@ $KV get /d2/a /d2/b
 
 # cpdir 遇 extindex：target 侧生成指向同一只读扩展的新 extindex
 echo "=== cpdir extindex → new overlay on target ==="
-$KV set /realext/ index:
+$KV mkindex /realext/
 $KV set /realext/a int:1
 $KV set /realext/b int:2
-$KV set /base/ index:
+$KV mkindex /base/
 $KV extindex /base/ /realext/
 $KV cpdir /base /ov
 $KV get /ov/a /ov/b

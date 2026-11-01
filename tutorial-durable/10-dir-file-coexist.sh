@@ -1,22 +1,28 @@
 #!/bin/bash
 # expected:
-# === tree shows dir and file ===
-# /
-# ├── b	value
+# === dir and file coexist ===
+# /t10/b	char/utf8:value
+# /t10/b/x	int64:1
+# === tree ===
+# /t10/
 # └── b/
 #     └── x	1
 # /end
 
 set -e
-KV="$HOME/.local/bin/kvspace"
-$KV deltree /b/
+KV="${KVSPACE_BIN:-kvspace}"
+$KV deltree /t10/
 
-$KV set /b/ index:
-$KV set /b string:value
-$KV set /b/x int:1
+$KV mkindex /t10/
+$KV mkindex /t10/b/
+$KV set /t10/b string:value
+$KV set /t10/b/x int:1
 
-echo "=== tree shows dir and file ==="
-$KV tree --showext=false /
+echo "=== dir and file coexist ==="
+$KV get /t10/b /t10/b/x
+
+echo "=== tree ==="
+$KV tree --showext=false /t10/
 
 
 

@@ -15,15 +15,15 @@
 # /end
 
 set -e
-KV="$HOME/.local/bin/kvspace"
+KV="${KVSPACE_BIN:-kvspace}"
 $KV deltree /ext/
 $KV deltree /base/
 
-$KV set /base/ index:
+$KV mkindex /base/
 $KV set /base/a int:1
 $KV extindex /ext/ /base/
 $KV set /ext/z int:42
-$KV set /ext/x/ index:
+$KV mkindex /ext/x/
 $KV set /ext/x/z int:99
 
 echo "=== tree showext true ==="

@@ -32,11 +32,11 @@
 # /end
 
 set -e
-KV="$HOME/.local/bin/kvspace"
+KV="${KVSPACE_BIN:-kvspace}"
 $KV deltree /base/
 $KV deltree /merge/
 
-$KV set /base/ index:
+$KV mkindex /base/
 $KV set /base/a int:1
 $KV set /base/b int:2
 $KV set /base/c int:3
@@ -59,7 +59,7 @@ $KV get /merge/z
 $KV list /merge/
 
 echo "=== nested write ==="
-$KV set /merge/nest/ index:
+$KV mkindex /merge/nest/
 $KV set /merge/nest/x int:42
 $KV set /merge/nest/y int:43
 $KV get /merge/nest/x /merge/nest/y

@@ -19,11 +19,11 @@
 # /end
 
 set -e
-KV="$HOME/.local/bin/kvspace"
+KV="${KVSPACE_BIN:-kvspace}"
 $KV deltree /t01/
 
 echo "=== Set & Get ==="
-$KV set /t01/ index:
+$KV mkindex /t01/
 $KV set /t01/a int:42
 $KV get /t01/a
 

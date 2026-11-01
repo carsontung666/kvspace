@@ -24,14 +24,15 @@
 # /end
 
 set -e
-KV="$HOME/.local/bin/kvspace"
+KV="${KVSPACE_BIN:-kvspace}"
 $KV deltree /tgt/
+$KV deltree /lnk
 
-$KV set /tgt/ index:
+$KV mkindex /tgt/
 $KV set /tgt/x int:42
 $KV set /tgt/y int:7
 $KV set /tgt/z string:hello
-$KV set /lnk "*index:/tgt/"
+$KV set /lnk "*:lib:/tgt/"
 
 echo "=== read through ==="
 $KV get /lnk/x /lnk/y
